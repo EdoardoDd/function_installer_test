@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: function-installer
+  namespace: prism-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: function-installer
+  template:
+    metadata:
+      labels:
+        app: function-installer
+    spec:
+      serviceAccountName: function-installer
+      containers:
+        - name: function-installer
+          image: edoardodd/prism-function-installer:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PRISM_NAMESPACE
+              value: "prism-system"
+            - name: PRISM_FUNCTION_NAMESPACE
+              value: "default"
+            - name: PRISM_SFCC_KUBECONFIG_PATH
+              value: "/etc/prism/sfcc-kubeconfig/kubeconfig"
+            - name: PRISM_REMOTE_WRITER_NAMESPACE
+              value: "prism-remote-writers"
+          volumeMounts:
+            - name: sfcc-kubeconfig
+              mountPath: /etc/prism/sfcc-kubeconfig
+              readOnly: true
+      volumes:
+        - name: sfcc-kubeconfig
+          secret:
+            # STESSO Secret usato da workflow-master (stesso nome, stesso
+            # ServiceAccount workflow-master-bivm-reader su sfcc) -
+            # depositato da bootstrap-cluster-access.sh anche su
+            # cloud-node, non un canale nuovo. Vedi bootstrap-cluster-access.sh.
+            secretName: sfcc-kubeconfig-bivm-reader
+            optional: true

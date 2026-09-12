@@ -1,0 +1,67 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: prismfunctiondeployments.prism.local
+spec:
+  group: prism.local
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: >-
+            Insieme dei siti su cui una funzione PRISM PUO' girare (pool
+            eleggibile). PrismRoutingPolicy.spec.destinations dovrebbe
+            sempre essere un sottoinsieme di spec.sites (vincolo non
+            enforced dal controller, solo concettuale).
+          properties:
+            spec:
+              type: object
+              properties:
+                function:
+                  type: string
+                  description: Nome della funzione / Knative Service
+                image:
+                  type: string
+                  description: Immagine container per la Knative Service
+                sites:
+                  type: array
+                  description: Siti su cui installare la funzione
+                  items:
+                    type: string
+              required:
+                - function
+                - image
+                - sites
+            status:
+              type: object
+              properties:
+                sites:
+                  type: array
+                  description: Stato di installazione per sito
+                  items:
+                    type: object
+                    properties:
+                      site:
+                        type: string
+                      state:
+                        type: string
+                        enum: ["installed", "error"]
+                      message:
+                        type: string
+      additionalPrinterColumns:
+        - name: function
+          type: string
+          jsonPath: .spec.function
+        - name: sites
+          type: string
+          jsonPath: .spec.sites
+  scope: Namespaced
+  names:
+    plural: prismfunctiondeployments
+    singular: prismfunctiondeployment
+    kind: PrismFunctionDeployment
+    shortNames:
+      - pfd

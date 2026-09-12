@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: function-installer
+  namespace: prism-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: function-installer
+  namespace: prism-system
+rules:
+  # legge le PrismFunctionDeployment dichiarate e ne aggiorna lo status
+  # (status.sites[] non ancora scritto - Step 5 - ma la regola sta qui
+  # gia' da ora per non dover ritoccare l'RBAC in un secondo momento)
+  - apiGroups: ["prism.local"]
+    resources: ["prismfunctiondeployments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["prism.local"]
+    resources: ["prismfunctiondeployments/status"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: function-installer
+  namespace: prism-system
+subjects:
+  - kind: ServiceAccount
+    name: function-installer
+    namespace: prism-system
+roleRef:
+  kind: Role
+  name: function-installer
+  apiGroup: rbac.authorization.k8s.io
