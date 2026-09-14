@@ -58,6 +58,8 @@ spec:
         - name: sites
           type: string
           jsonPath: .spec.sites
+      subresources:
+        status: {}
   scope: Namespaced
   names:
     plural: prismfunctiondeployments
