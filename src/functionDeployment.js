@@ -43,7 +43,24 @@ async function reconcileFunctionDeployment(deployment) {
     try {
       await installOnSite(site, fn, image);
     } catch (err) {
-      console.error(`Impossibile installare '${fn}' su '${site}':`, err.message || err);
+      // err.message spesso e' un generico "HTTP request failed" nel client
+      // fetch-based di @kubernetes/client-node (0.20+), sia per errori di
+      // rete sia per risposte non-2xx (es. 403 Forbidden) - il dettaglio
+      // vero va cercato in statusCode/body/cause, altrimenti si naviga alla
+      // cieca. Logghiamo tutto quello che puo' aiutare a distinguere i casi:
+      //   - err.cause: errore di rete Node grezzo (es. EHOSTUNREACH, ECONNREFUSED, x509)
+      //   - err.statusCode / err.response.statusCode: risposta HTTP ricevuta (es. 403)
+      //   - err.body: corpo della risposta dell'apiserver, se presente (spesso ha .message)
+      const statusCode = err?.statusCode ?? err?.response?.statusCode;
+      const cause = err?.cause?.message || err?.cause;
+      const body = typeof err?.body === "string" ? err.body : JSON.stringify(err?.body?.message || err?.body || "");
+      console.error(
+        `Impossibile installare '${fn}' su '${site}':`,
+        err.message || err,
+        statusCode ? `| statusCode=${statusCode}` : "",
+        cause ? `| cause=${cause}` : "",
+        body && body !== '""' ? `| body=${body}` : ""
+      );
     }
   }
 }
