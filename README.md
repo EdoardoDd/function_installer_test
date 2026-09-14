@@ -26,15 +26,21 @@ kubectl apply -f prism_infra.yaml
 
 `cloud.yaml` provisiona, in ordine:
 
-- **k3s** come control plane indipendente (`--disable traefik`, `--write-kubeconfig-mode 644`). `cloud-node` non è trattato come caso speciale di "solo control-plane": il paper PRISM tratta esplicitamente il Cloud come sito di esecuzione a tutti gli effetti ("The Cloud can also execute its workflow internally, and it also expose its triggers"), quindi riceve lo stesso identico stack di serving di un edge-node.
+- **k3s** come control plane indipendente (`--disable traefik`, `--disable servicelb`, `--write-kubeconfig-mode 644`). `cloud-node` non è trattato come caso speciale di "solo control-plane": il paper PRISM tratta esplicitamente il Cloud come sito di esecuzione a tutti gli effetti ("The Cloud can also execute its workflow internally, and it also expose its triggers"), quindi riceve lo stesso identico stack di serving di un edge-node.
 - **Helm**, per installare i chart successivi.
 - **Knative Serving + Kourier**, stessa versione degli edge-node, con `config-network` puntato su `kourier.ingress.networking.knative.dev`.
 - **kube-prometheus-stack** (namespace `monitoring`).
 - **Traefik**, con due `entryPoint` dedicati: `web` (nodePort 30080, traffico client-facing, può essere splittato da `workflow-master`) e `internal` (nodePort 30090, solo mesh interno tra siti, mai splittato).
-- **Self-provisioning della credenziale di scrittura remota**: `cloud-node` genera per sé stesso, con l'accesso admin che ha già in questo momento del boot, un `ServiceAccount`/`Role`/`RoleBinding` `workflow-master-remote-writer` scoped (IngressRoute/TraefikService, Service, EndpointSlice, e Knative Service). Nessun kubeconfig admin lascia mai il nodo; il kubeconfig scoped risultante viene scritto in `/etc/prism/self-remote-writer-kubeconfig.yaml`. È lo stesso identico meccanismo già usato dagli edge-node — necessario perché `cloud-node` è ora un sito installabile a tutti gli effetti (può comparire in `spec.sites`).
+- **Self-provisioning della credenziale di scrittura remota**: `cloud-node` genera per sé stesso, con l'accesso admin che ha già in questo momento del boot, un `ServiceAccount workflow-master-remote-writer` e **due** coppie `Role`/`RoleBinding` distinte:
+  - una in `prism-system` (IngressRoute/TraefikService, Service core, EndpointSlice);
+  - una dedicata in `default` (cioè `FUNCTION_NAMESPACE`), per la sola Knative Service.
+
+  I due namespace sono diversi apposta, e servono due `Role`/`RoleBinding` apposta: un `Role` (a differenza di un `ClusterRole`) concede permessi solo nel proprio namespace, quindi una regola per `serving.knative.dev` messa nel `Role` di `prism-system` non avrebbe mai avuto effetto sulla Knative Service, che vive in `default`. Il secondo `RoleBinding` lega comunque lo stesso, unico `ServiceAccount` — un `RoleBinding` può referenziare un `ServiceAccount` di un namespace diverso dal proprio, non serve duplicarlo. Nessun kubeconfig admin lascia mai il nodo; il kubeconfig scoped risultante viene scritto in `/etc/prism/self-remote-writer-kubeconfig.yaml`. È lo stesso identico meccanismo già usato dagli edge-node — necessario perché `cloud-node` è ora un sito installabile a tutti gli effetti (può comparire in `spec.sites`).
 - **`function-installer` stesso**: clonato da un'immagine già pubblicata (nessun build al boot, nessun segreto nell'immagine — il kubeconfig verso `sfcc` è montato a runtime da un `Secret`), applica `rbac.yaml`, il CRD `PrismFunctionDeployment` e `deployment.yaml`. A differenza di `workflow-master`, parte già attivo: non aspetta nessuna `PrismMasterAssignment`.
 
 > `--write-kubeconfig-mode 644` rende `/etc/rancher/k3s/k3s.yaml` leggibile da chiunque abbia un account sulla VM (non solo root) — necessario perché `getKubeconfigUtils` lo legge via SSH senza `sudo`. È un kubeconfig admin del cluster locale del nodo reso world-readable: una scelta consapevole, accettabile qui perché le VM sono a uso singolo, ma da tenere presente.
+
+> `--disable servicelb` disattiva il `ServiceLB` integrato di k3s. Il manifest di Kourier crea, oltre a `kourier-internal` (ClusterIP, l'unico che usiamo — Traefik instrada sempre lì), anche un Service `kourier` di tipo `LoadBalancer` che non usiamo mai. Senza disabilitarlo, k3s gli assegna un nodePort **casuale** che può collidere con i nodePort fissi di Traefik (30080/30443/30090), facendo fallire l'installazione del chart in modo intermittente e difficile da riprodurre (visto in pratica su un sito su dieci, in un giro di provisioning su dieci nodi).
 
 Verifica dopo il boot:
 
@@ -76,7 +82,7 @@ metadata:
   namespace: prism-system
 spec:
   function: workflow-0
-  image: gcr.io/knative-samples/autoscale-go:0.1
+  image: ghcr.io/knative/autoscale-go:latest
   sites:
     - cloud-node
     - edge-node-1
@@ -113,6 +119,14 @@ Non ancora implementato (deliberatamente fuori scope di questo step):
 
 - **Cleanup sui siti rimossi** da `spec.sites` (confrontando con l'ultimo `status.sites[]` noto) — l'helper `deleteCustomObject` esiste già in `customObjects.js`, pronto per essere richiamato.
 - **Scrittura di `status.sites[]`** sulla CR con l'esito per sito.
+
+## Validazione sul testbed reale
+
+Il flusso completo (provisioning → bootstrap accessi → `PrismFunctionDeployment` → Knative Service + IngressRoute → risposta HTTP reale) è stato validato end-to-end sul testbed a 10 nodi (`cloud-node` + `edge-node-1..9`). Durante il primo giro di test sono emersi alcuni problemi reali, tutti di infrastruttura/configurazione (nessuno nella logica del controller):
+
+- **`nodePort` in collisione**: il `ServiceLB` di k3s assegna un nodePort casuale al Service `kourier` (tipo `LoadBalancer`, mai usato in questo design), che può scontrarsi con i nodePort fissi di Traefik — vedi `--disable servicelb` sopra.
+- **RBAC scoped al namespace sbagliato**: la regola `serving.knative.dev` va in un `Role`/`RoleBinding` dedicato nel namespace `default` (`FUNCTION_NAMESPACE`), non in quello di `prism-system` — vedi sopra. Il sintomo era fuorviante: il client `@kubernetes/client-node` appiattisce sia gli errori di rete sia le risposte HTTP non-2xx (es. un 403) nello stesso generico `"HTTP request failed"`, senza dettagli in `err.message`. Il dettaglio vero va cercato in `err.statusCode`/`err.response.statusCode`/`err.body`.
+- **Tag immagine sample obsoleto**: `gcr.io/knative-samples/autoscale-go:0.1` non esiste più (404) — Knative ha spostato le immagini di esempio su `ghcr.io/knative/...`.
 
 ## Struttura dei moduli
 
