@@ -41,6 +41,13 @@ function watchFunctionDeployments(watch) {
   listWatch.on("update", (obj) => {
     reconcileFunctionDeployment(obj).catch((err) => console.error("Errore in reconcile (update):", err));
   });
+  // Con il finalizer (vedi functionDeployment.js) la cancellazione vera e
+  // propria avviene solo DOPO che il cleanup ha rimosso il finalizer -
+  // questo evento "delete" arriva quindi a pulizia gia' completata, non
+  // c'e' altro da fare se non un log.
+  listWatch.on("delete", (obj) => {
+    console.log(`PrismFunctionDeployment '${obj?.metadata?.name}' cancellata (cleanup gia' completato via finalizer).`);
+  });
   listWatch.on("error", (err) => console.error("Errore nel watch di PrismFunctionDeployment:", err));
 }
 

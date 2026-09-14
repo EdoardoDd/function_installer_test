@@ -22,6 +22,20 @@
  * dichiari "subresources: status" (altrimenti l'RBAC su
  * "prismfunctiondeployments/status" non ha nessun endpoint a cui
  * applicarsi) - vedi crds/prism-functiondeployment-crd.yaml.
+ *
+ * CANCELLAZIONE DELLA CR - il ListWatch di index.js reagisce solo ad
+ * "add"/"update": se la PrismFunctionDeployment viene cancellata, senza
+ * altro accorgimento nessun sito verrebbe mai ripulito (la risorsa
+ * sparisce e basta, nessun evento utile arriva). Si usa quindi un
+ * finalizer standard: alla prima riconciliazione lo si aggiunge alla CR
+ * (questo BLOCCA la cancellazione finche' non viene rimosso); quando
+ * arriva un evento "update" con metadata.deletionTimestamp valorizzato
+ * (kubectl ha segnato la CR per la cancellazione ma non l'ha ancora
+ * rimossa, proprio perche' il finalizer e' ancora presente), si fa il
+ * cleanup di TUTTI i siti conosciuti (spec.sites + status.sites, per
+ * sicurezza - la CR potrebbe essere cancellata subito dopo una modifica
+ * non ancora riflessa in status.sites) e infine si rimuove il finalizer,
+ * a quel punto Kubernetes la cancella per davvero.
  */
 
 const { getClientsForSite, customApi } = require("./k8sClients");
@@ -42,6 +56,10 @@ const {
 } = require("./config");
 
 const PRISM_PLURAL = "prismfunctiondeployments";
+
+// Finalizer applicato ad ogni PrismFunctionDeployment: blocca la
+// cancellazione finche' il cleanup sui siti non e' completato.
+const CLEANUP_FINALIZER = "prism.local/function-installer-cleanup";
 
 /** Applica Knative Service + IngressRoute di baseline su un singolo sito. */
 async function installOnSite(site, fn, image) {
@@ -97,13 +115,90 @@ async function patchStatus(name, namespace, sitesStatus) {
 }
 
 /**
+ * Sostituisce metadata.finalizers sulla CR (merge patch: un JSON merge
+ * patch rimpiazza un array per intero, comportamento voluto qui - passiamo
+ * sempre la lista completa gia' calcolata, mai un "delta").
+ */
+async function patchFinalizers(name, namespace, finalizers) {
+  await customApi.patchNamespacedCustomObject(
+    PRISM_GROUP,
+    PRISM_VERSION,
+    namespace,
+    PRISM_PLURAL,
+    name,
+    { metadata: { finalizers } },
+    undefined,
+    undefined,
+    undefined,
+    MERGE_PATCH_OPTS
+  );
+}
+
+/**
+ * Cancellazione in corso (metadata.deletionTimestamp valorizzato): pulisce
+ * TUTTI i siti conosciuti - unione di spec.sites e status.sites, cosi' un
+ * sito aggiunto/rimosso appena prima della cancellazione (magari non
+ * ancora riflesso in status.sites) viene comunque ripulito - poi rimuove
+ * il finalizer per lasciare completare la cancellazione a Kubernetes.
+ */
+async function finalizeFunctionDeployment(deployment) {
+  const name = deployment.metadata.name;
+  const namespace = deployment.metadata.namespace;
+  const finalizers = deployment.metadata.finalizers || [];
+
+  if (!finalizers.includes(CLEANUP_FINALIZER)) {
+    // Gia' finalizzata (o mai stata finalizzata) - nulla da fare.
+    return;
+  }
+
+  const fn = deployment.spec.function;
+  const specSites = deployment.spec.sites || [];
+  const statusSites = ((deployment.status && deployment.status.sites) || []).map((s) => s.site);
+  const allKnownSites = [...new Set([...specSites, ...statusSites])];
+
+  console.log(`PrismFunctionDeployment '${name}' in cancellazione: cleanup di '${fn}' su [${allKnownSites.join(", ")}]`);
+
+  for (const site of allKnownSites) {
+    try {
+      await uninstallFromSite(site, fn);
+    } catch (err) {
+      console.error(`Impossibile rimuovere '${fn}' da '${site}' durante la cancellazione:`, describeError(err));
+      // Best-effort anche qui: un sito irraggiungibile non deve bloccare
+      // per sempre la cancellazione della CR (nessun retry automatico,
+      // vedi nota su retry/resync nel README - limite noto).
+    }
+  }
+
+  const remainingFinalizers = finalizers.filter((f) => f !== CLEANUP_FINALIZER);
+  await patchFinalizers(name, namespace, remainingFinalizers);
+  console.log(`Finalizer rimosso da '${name}', cancellazione della CR completata da Kubernetes.`);
+}
+
+/**
  * Riconcilia una PrismFunctionDeployment: cleanup sui siti rimossi da
  * spec.sites (Step 4), poi install/update best-effort sui siti desiderati,
  * poi scrittura di status.sites[] con l'esito (Step 5).
+ *
+ * Se la CR e' in cancellazione (deletionTimestamp valorizzato), delega
+ * tutto a finalizeFunctionDeployment e NON fa il normale giro di
+ * install/status - non avrebbe senso reinstallare qualcosa che sta per
+ * sparire.
  */
 async function reconcileFunctionDeployment(deployment) {
   const name = deployment.metadata.name;
   const namespace = deployment.metadata.namespace;
+
+  if (deployment.metadata.deletionTimestamp) {
+    await finalizeFunctionDeployment(deployment);
+    return;
+  }
+
+  const finalizers = deployment.metadata.finalizers || [];
+  if (!finalizers.includes(CLEANUP_FINALIZER)) {
+    await patchFinalizers(name, namespace, [...finalizers, CLEANUP_FINALIZER]);
+    console.log(`Finalizer aggiunto a '${name}' (garantisce il cleanup dei siti se la CR viene cancellata).`);
+  }
+
   const { function: fn, image, sites } = deployment.spec;
   const desiredSites = sites || [];
   const previousSites = ((deployment.status && deployment.status.sites) || []).map((s) => s.site);

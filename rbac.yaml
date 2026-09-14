@@ -10,12 +10,14 @@ metadata:
   name: function-installer
   namespace: prism-system
 rules:
-  # legge le PrismFunctionDeployment dichiarate e ne aggiorna lo status
-  # (status.sites[] non ancora scritto - Step 5 - ma la regola sta qui
-  # gia' da ora per non dover ritoccare l'RBAC in un secondo momento)
+  # legge le PrismFunctionDeployment dichiarate; "patch"/"update" servono
+  # per gestire metadata.finalizers (aggiunta alla prima riconciliazione,
+  # rimozione a fine cleanup quando la CR viene cancellata - vedi
+  # finalizeFunctionDeployment in functionDeployment.js). I finalizer
+  # vivono sulla risorsa principale, non sul subresource /status.
   - apiGroups: ["prism.local"]
     resources: ["prismfunctiondeployments"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["prism.local"]
     resources: ["prismfunctiondeployments/status"]
     verbs: ["get", "patch", "update"]

@@ -17,7 +17,7 @@ spec:
       containers:
         - name: function-installer
           image: edoardodd/prism-function-installer:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           env:
             - name: PRISM_NAMESPACE
               value: "prism-system"

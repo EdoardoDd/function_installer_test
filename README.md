@@ -97,7 +97,7 @@ spec:
   > "developers define functions and associated SLAs, and upload them on the PRISM endpoint that will masquerade the complexity and dynamicity of distributing these functions across cloud continuum resources"
 
   `spec.sites` è quindi un proxy temporaneo di quella decisione: in futuro sarà il Cloud Controller/DRL (o un suo equivalente) a scriverlo, senza che `function-installer` debba cambiare — il controller reagisce alla CR indipendentemente da chi la scrive. `PrismRoutingPolicy.spec.destinations` (in `workflow-master`) dovrebbe sempre essere un sottoinsieme di `spec.sites` — vincolo concettuale, non verificato dal controller.
-- `status.sites[]`: stato di installazione per sito (`installed`/`error` + messaggio) — campo già previsto nel CRD, non ancora scritto dal controller (Step 5, vedi sotto).
+- `status.sites[]`: stato di installazione per sito (`installed`/`error` + messaggio), scritto dal controller ad ogni riconciliazione (Step 5, vedi sotto). Richiede che il CRD dichiari `subresources: { status: {} }` — senza, l'RBAC su `prismfunctiondeployments/status` non ha nessun endpoint a cui applicarsi.
 
 ## Funzionamento del controller
 
@@ -115,10 +115,15 @@ Nessun master-gating qui (a differenza di `workflow-master`, che agisce solo se 
 
 L'installazione per-sito è **best-effort**: un fallimento su un sito (es. `Secret remote-writer-<sito>` non ancora pronto) viene loggato ma non blocca gli altri siti in `spec.sites` — stesso pattern usato da `workflow-master` per `PrismRoutingPolicy`.
 
-Non ancora implementato (deliberatamente fuori scope di questo step):
+**Cleanup sui siti rimossi (Step 4)**: ad ogni riconciliazione, i siti presenti nell'ultimo `status.sites[]` noto ma non più in `spec.sites` vengono disinstallati (Knative Service + entrambe le IngressRoute rimosse dal sito, via `deleteCustomObject`, idempotente). `status.sites[]` è quindi la fonte di verità per "dove avevamo installato la funzione l'ultima volta" — scelta deliberata rispetto all'alternativa di interrogare live tutti i siti storicamente noti: più semplice, e sufficiente perché è lo stesso controller a scrivere quello stato ad ogni giro (Step 5).
 
-- **Cleanup sui siti rimossi** da `spec.sites` (confrontando con l'ultimo `status.sites[]` noto) — l'helper `deleteCustomObject` esiste già in `customObjects.js`, pronto per essere richiamato.
-- **Scrittura di `status.sites[]`** sulla CR con l'esito per sito.
+**Scrittura di `status.sites[]` (Step 5)**: dopo il giro di cleanup/install, il controller scrive `status.sites[]` con l'esito per sito (`installed`/`error` + messaggio), via subresource `/status` (merge patch).
+
+**Cancellazione della CR (finalizer)**: il `ListWatch` reagisce solo ad `add`/`update`, non a `delete` — senza altro accorgimento, cancellare l'intera `PrismFunctionDeployment` non avrebbe ripulito nessun sito (la risorsa sparisce e basta, nessun evento utile arriva prima). Il controller aggiunge quindi il finalizer `prism.local/function-installer-cleanup` alla CR alla prima riconciliazione — questo **blocca** la cancellazione effettiva finché il finalizer non viene rimosso. Quando arriva un evento `update` con `metadata.deletionTimestamp` valorizzato (la CR è "in cancellazione" ma ancora presente proprio grazie al finalizer), il controller ripulisce tutti i siti conosciuti — unione di `spec.sites` e `status.sites[]`, per coprire anche un sito aggiunto/rimosso appena prima della cancellazione e non ancora riflesso in `status` — e infine rimuove il finalizer, lasciando che Kubernetes completi la cancellazione. Best-effort anche qui: un sito irraggiungibile viene loggato ma non blocca la rimozione del finalizer sugli altri.
+
+Non ancora implementato (deliberatamente fuori scope):
+
+- **Retry/resync** per i siti falliti: un errore transitorio (es. `Secret remote-writer-<sito>` non ancora pronto) resta in stato `error` finché non arriva un altro evento `update` sulla CR (stesso limite anche durante il cleanup su cancellazione: un sito irraggiungibile in quel momento non viene ritentato automaticamente).
 
 ## Validazione sul testbed reale
 
@@ -127,6 +132,10 @@ Il flusso completo (provisioning → bootstrap accessi → `PrismFunctionDeploym
 - **`nodePort` in collisione**: il `ServiceLB` di k3s assegna un nodePort casuale al Service `kourier` (tipo `LoadBalancer`, mai usato in questo design), che può scontrarsi con i nodePort fissi di Traefik — vedi `--disable servicelb` sopra.
 - **RBAC scoped al namespace sbagliato**: la regola `serving.knative.dev` va in un `Role`/`RoleBinding` dedicato nel namespace `default` (`FUNCTION_NAMESPACE`), non in quello di `prism-system` — vedi sopra. Il sintomo era fuorviante: il client `@kubernetes/client-node` appiattisce sia gli errori di rete sia le risposte HTTP non-2xx (es. un 403) nello stesso generico `"HTTP request failed"`, senza dettagli in `err.message`. Il dettaglio vero va cercato in `err.statusCode`/`err.response.statusCode`/`err.body`.
 - **Tag immagine sample obsoleto**: `gcr.io/knative-samples/autoscale-go:0.1` non esiste più (404) — Knative ha spostato le immagini di esempio su `ghcr.io/knative/...`.
+
+L'interazione con `workflow-master` è stata validata separatamente end-to-end (vedi le note di progetto): `PrismRoutingPolicy`/`PrismMasterAssignment` fanno correttamente sovrascrivere a `workflow-master` la `-local` IngressRoute con un `TraefikService` pesato, lasciando `-internal` intatta, e il traffico reale si distribuisce esattamente secondo i pesi configurati (verificato via access log JSON di Traefik, campo `ServiceAddr`).
+
+Durante l'implementazione di Step 4/5 è emerso un problema di **deploy, non di codice**: dopo aver corretto `functionDeployment.js` e ripubblicato l'immagine, il pod continuava a girare con il codice vecchio nonostante `rollout restart` multipli. Causa: `deployment.yaml` aveva `imagePullPolicy: IfNotPresent` con un tag mobile (`:latest`) — il nodo riusa l'immagine `:latest` già presente in locale invece di ripullarla dal registry, anche dopo un restart del rollout (che ricrea il Pod ma non forza un pull con quella policy). Diagnosi confermata confrontando l'`imageID` (digest) effettivo del pod in esecuzione con quello del digest appena pushato — non coincidevano. Fix: `imagePullPolicy: Always` in `deployment.yaml`. Nota per il futuro: con un tag mobile serve sempre `Always` (più traffico di rete ad ogni restart, anche a immagine invariata); un'alternativa più robusta sarebbe taggare le immagini con qualcosa di univoco (es. short SHA del commit) invece di riusare sempre `:latest`.
 
 ## Struttura dei moduli
 
@@ -137,5 +146,5 @@ Il flusso completo (provisioning → bootstrap accessi → `PrismFunctionDeploym
 | `src/customObjects.js` | Helper generici create-or-patch (`applyCustomObject`) e delete idempotente (`deleteCustomObject`) per qualunque CustomResource. |
 | `src/knativeService.js` | Costruisce e applica la Knative Service `cluster-local` per una funzione su un sito. |
 | `src/ingressBaseline.js` | Costruisce e applica le due IngressRoute di baseline (`-local`, `-internal`) per una funzione su un sito. |
-| `src/functionDeployment.js` | Riconciliazione di una `PrismFunctionDeployment`: per ogni sito in `spec.sites`, Knative Service + IngressRoute di baseline, best-effort. |
+| `src/functionDeployment.js` | Riconciliazione di una `PrismFunctionDeployment`: se in cancellazione (`deletionTimestamp`), cleanup di tutti i siti noti e rimozione del finalizer; altrimenti cleanup dei soli siti rimossi da `spec.sites` (Step 4), poi Knative Service + IngressRoute di baseline sui siti desiderati (best-effort), poi scrittura di `status.sites[]` con l'esito per sito (Step 5). |
 | `src/index.js` | Entry point: avvia il `ListWatch` sulle `PrismFunctionDeployment` e collega gli eventi alla riconciliazione. |
